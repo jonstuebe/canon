@@ -1,2 +1,3 @@
-//! Rename TV episode files to a canonical "Show Name SxxEyy.ext" form.
+//! Rename TV episode and movie files to a canonical name.
+pub mod movie;
 pub mod parse;

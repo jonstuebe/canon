@@ -1,14 +1,17 @@
 # canon
 
-Rename TV episode files to a canonical `Show Name SxxEyy.ext`, deterministically.
+Rename TV episode and movie files to a canonical name, deterministically.
 
 ```
 The Big Bang Theory (Kaley Cuoco) S07E08 1080p H.264 (moviesbyrizzo upload).mp4
    -> The Big Bang Theory S07E08.mp4
+
+Elio.2025.1080p.WEBRip.x264.AAC5.1-[YTS.MX].mp4
+   -> Elio (2025).mp4
 ```
 
-No network calls, no metadata provider, no fuzzy matching against a show
-database. Everything is derived from the filenames you pass in.
+No network calls, no metadata provider, no fuzzy matching against a show or
+movie database. Everything is derived from the filenames you pass in.
 
 ## Install
 
@@ -18,21 +21,49 @@ cargo install --path .
 
 ## Use
 
+`canon` has two subcommands, one per media type:
+
 ```sh
-canon ~/Downloads/Breaking\ Bad\ Season\ 5           # dry run: show what would change
-canon --apply ~/Downloads/Breaking\ Bad\ Season\ 5   # confirm, then rename
+canon shows ~/Downloads/Breaking\ Bad\ Season\ 5    # dry run: show what would change
+canon shows --apply ~/Downloads/Breaking\ Bad\ Season\ 5
+
+canon movies ~/Downloads/Movies                     # dry run
+canon movies --apply ~/Downloads/Movies
 ```
+
+| flag | effect |
+|---|---|
+| `--apply` | perform the renames (default is a dry run) |
+| `--yes` | skip confirmation and accept every detected name |
+
+### `canon shows`
 
 Point it at one show's directory at a time. Every file directly inside it is
 assumed to belong to the same show, and the name is decided **across all of
 them at once** — see "Batch consensus" below — then applied uniformly.
 
-| flag | effect |
-|---|---|
-| `--apply` | perform the renames (default is a dry run) |
-| `--yes` | skip the confirm step and accept the detected name |
+### `canon movies`
 
-## How it works
+Point it at a directory of movies — every file inside is assumed to be a
+*different* movie, so there's no batch consensus: each file is renamed to
+`Title (Year).ext` on its own. The anchor is the release year — the **last**
+`19xx`/`20xx`-shaped number in the name, so a sequel number (`Incredibles 2`)
+or a year baked into the title itself (`Blade Runner 2049`) doesn't get
+mistaken for it; whatever comes after the year is always release junk and is
+discarded, since (unlike shows) there's no ambiguity about which side the
+title is on.
+
+Every planned rename is listed at once; high-confidence lines are accepted
+silently, and only a `LOW` line — no year could be found — stops to ask for a
+title (or drops that file on an empty answer):
+
+```
+Elio (2025).mp4                     [high]
+Fantasia (1940).mkv                 [high]
+Some Weird Movie No Year At All.mp4 [LOW] -> type title or Enter to skip:
+```
+
+## How `canon shows` works
 
 **1. The anchor.** Locate the season/episode marker — `S07E08`, `s07.e08`,
 `S7 E8`, `7x03`, `Season 2 Episode 5`. It splits the filename in two, and it is
@@ -98,11 +129,16 @@ These are design boundaries, not bugs:
 - **No anchor, no rename.** Date-based shows (`The Daily Show 2024.03.14`) and
   anime absolute numbering (`Show Name - 043`) are skipped rather than guessed.
 - **Multi-episode files** (`S01E01-E02`) keep only the first episode number.
-- **Unbracketed years** stay in the title — stripping them would break
+- **Unbracketed years** stay in a show title — stripping them would break
   legitimate titles like `Class of 1999`.
 - **Casing is preserved, never corrected.** `its always sunny` stays lowercase.
 - **Dotted initialisms** lose their dots: `S.H.I.E.L.D.` becomes `S H I E L D`.
 - **Leading junk** is only removed when bracketed, a domain, or the entire side.
+- **Movies: a title containing two year-shaped numbers** is resolved by
+  taking the *last* one as the release year (`Blade Runner 2049 (2017)`),
+  which is right for scene-style names but can misfire on unusual ones.
+- **Movies: no year, no confidence.** A movie release with no `19xx`/`20xx`
+  token anywhere in the name always comes back `LOW` and asks for a title.
 
 ## Why not an existing crate
 
@@ -118,6 +154,10 @@ looks like the same batch idea, does not change that. Two also truncate
 ```sh
 cargo test          # tests covering anchors, cleaning, decisions, gaps
 ```
+
+`src/parse.rs` (shows) and `src/movie.rs` (movies) are independent, pure-logic
+modules with their own test files (`tests/parse_tests.rs`, `tests/movie_tests.rs`);
+`main.rs` only wires I/O and prompting around whichever one the subcommand picks.
 
 `reference/rename_eps.py` is the original Python prototype. Its `clean`/`split`
 functions are kept as a differential-testing oracle for the anchor and

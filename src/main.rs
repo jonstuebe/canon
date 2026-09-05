@@ -1,5 +1,6 @@
-//! Interactive CLI: scan one show directory, confirm a name once, then apply.
+//! Interactive CLI: `canon shows <dir>` and `canon movies <dir>`.
 
+use canon::movie::{plan_movies, MoviePlan};
 use canon::parse::{plan_dir, Confidence, Plan, Season};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -14,20 +15,28 @@ const GRN: &str = "\x1b[32m";
 const OFF: &str = "\x1b[0m";
 
 const USAGE: &str = "\
-canon -- rename TV episode files to \"Show Name SxxEyy.ext\"
+canon -- rename media files to a canonical name
 
 USAGE:
-    canon [OPTIONS] <DIRECTORY>
+    canon shows  [OPTIONS] <DIRECTORY>
+    canon movies [OPTIONS] <DIRECTORY>
 
 OPTIONS:
     --apply           perform the renames (default: dry run)
-    --yes             skip the confirm step, accept the detected name
+    --yes             skip confirmation, accept every detected name
     -h, --help        show this help
     -V, --version     show version
 
-canon looks at every file directly inside DIRECTORY, decides a single show
-name for all of them (using agreement across the files, falling back to the
-directory name), and confirms that name once before renaming.
+shows:
+    Every file directly inside DIRECTORY is assumed to belong to one show.
+    canon decides a single name for all of them (agreement across files,
+    falling back to the directory name) and confirms it once, renaming to
+    \"Show Name SxxEyy.ext\".
+
+movies:
+    Every file directly inside DIRECTORY is assumed to be a different movie.
+    canon renames each to \"Title (Year).ext\", listing every result; it only
+    stops to ask when a file's year (and so its title) can't be found.
 ";
 
 struct Args {
@@ -36,10 +45,10 @@ struct Args {
     yes: bool,
 }
 
-fn parse_args() -> Result<Option<Args>, String> {
+fn parse_common(sub: &str, args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
     let mut dir = None;
     let (mut apply, mut yes) = (false, false);
-    for a in std::env::args().skip(1) {
+    for a in args {
         match a.as_str() {
             "--apply" => apply = true,
             "--yes" | "-y" => yes = true,
@@ -53,10 +62,10 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown flag: {s}")),
             s if dir.is_none() => dir = Some(PathBuf::from(s)),
-            s => return Err(format!("canon takes one directory; got an extra argument: {s}")),
+            s => return Err(format!("canon {sub} takes one directory; got an extra argument: {s}")),
         }
     }
-    let dir = dir.ok_or("no directory given (try --help)")?;
+    let dir = dir.ok_or_else(|| format!("no directory given (try `canon {sub} --help`)"))?;
     if !dir.is_dir() {
         return Err(format!("not a directory: {}", dir.display()));
     }
@@ -116,6 +125,8 @@ fn mark(c: Confidence) -> String {
     }
 }
 
+// --- shows ---
+
 fn show_summary(plan: &Plan) {
     println!();
     let name = if plan.name.is_empty() { format!("{DIM}(none found){OFF}") } else { plan.name.clone() };
@@ -135,7 +146,7 @@ fn show_summary(plan: &Plan) {
 
 /// One confirmation for the whole directory: accept, decline, or type a name.
 /// Returns false if the user declined.
-fn confirm(plan: &mut Plan, auto_yes: bool) -> bool {
+fn confirm_show(plan: &mut Plan, auto_yes: bool) -> bool {
     let mut console = Console::new();
     loop {
         show_summary(plan);
@@ -156,16 +167,7 @@ fn confirm(plan: &mut Plan, auto_yes: bool) -> bool {
     }
 }
 
-fn main() -> ExitCode {
-    let args = match parse_args() {
-        Ok(Some(a)) => a,
-        Ok(None) => return ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("canon: {e}");
-            return ExitCode::from(2);
-        }
-    };
-
+fn cmd_shows(args: Args) -> ExitCode {
     let paths = match read_dir_files(&args.dir) {
         Ok(p) => p,
         Err(e) => {
@@ -188,15 +190,77 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    if !confirm(&mut plan, args.yes) {
+    if !confirm_show(&mut plan, args.yes) {
         println!("\nAborted, nothing renamed.");
         return ExitCode::SUCCESS;
     }
 
-    // --- safety checks before touching disk ---
+    apply_renames(plan.targets(), &plan.skipped, args.apply)
+}
+
+// --- movies ---
+
+/// Confirm every planned movie rename in one pass: high-confidence lines
+/// are listed and accepted silently, `Low` (no year found) stops to ask
+/// for a title, or drops the file on an empty answer.
+fn confirm_movies(plan: &mut MoviePlan, auto_yes: bool) -> Vec<(PathBuf, String)> {
+    let mut console = Console::new();
+    let width = plan.items.iter().map(|i| i.target().len()).max().unwrap_or(0);
+    let mut targets = Vec::new();
+    let mut newly_skipped = Vec::new();
+
+    for item in plan.items.iter_mut() {
+        if item.confidence == Confidence::Low {
+            if auto_yes {
+                newly_skipped.push((item.basename(), "low confidence, no year found".to_string()));
+                continue;
+            }
+            let prompt = format!("{:width$} [{}] -> type title or Enter to skip: ", item.target(), mark(Confidence::Low));
+            let typed = console.ask(&prompt);
+            if typed.trim().is_empty() {
+                newly_skipped.push((item.basename(), "no year found, skipped".to_string()));
+                continue;
+            }
+            item.set_title(&typed);
+        } else {
+            println!("{:width$} [{}]", item.target(), mark(item.confidence));
+        }
+        targets.push((item.path.clone(), item.target()));
+    }
+
+    plan.skipped.extend(newly_skipped);
+    targets
+}
+
+fn cmd_movies(args: Args) -> ExitCode {
+    let paths = match read_dir_files(&args.dir) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("canon: can't read {}: {e}", args.dir.display());
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut plan = plan_movies(&paths);
+    if plan.items.is_empty() {
+        println!("Nothing to rename.");
+        for (base, why) in &plan.skipped {
+            println!("  {DIM}SKIP  {base}  ({why}){OFF}");
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    println!();
+    let targets = confirm_movies(&mut plan, args.yes);
+    apply_renames(targets, &plan.skipped, args.apply)
+}
+
+// --- shared: safety checks + apply, once a target list has been confirmed ---
+
+fn apply_renames(targets: Vec<(PathBuf, String)>, skipped: &[(String, String)], apply: bool) -> ExitCode {
     let mut planned: Vec<(PathBuf, String)> = Vec::new();
     let mut unchanged = 0usize;
-    for (path, new) in plan.targets() {
+    for (path, new) in targets {
         if path.file_name().is_some_and(|f| f.to_string_lossy() == new) {
             unchanged += 1;
         } else {
@@ -222,7 +286,7 @@ fn main() -> ExitCode {
     if unchanged > 0 {
         println!("  {DIM}{unchanged} file(s) already correctly named{OFF}");
     }
-    for (base, why) in &plan.skipped {
+    for (base, why) in skipped {
         println!("  {DIM}skipped: {base}  ({why}){OFF}");
     }
     for n in &collisions {
@@ -235,7 +299,7 @@ fn main() -> ExitCode {
     if planned.is_empty() {
         return ExitCode::SUCCESS;
     }
-    if !args.apply {
+    if !apply {
         println!("\n{DIM}Dry run. Re-run with --apply to perform these renames.{OFF}");
         return ExitCode::SUCCESS;
     }
@@ -258,4 +322,46 @@ fn main() -> ExitCode {
     }
     println!("Renamed {done} file(s).");
     if failed > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS }
+}
+
+fn main() -> ExitCode {
+    let mut raw_args = std::env::args().skip(1);
+    let sub = match raw_args.next() {
+        Some(s) => s,
+        None => {
+            print!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+
+    match sub.as_str() {
+        "shows" => match parse_common("shows", raw_args) {
+            Ok(Some(a)) => cmd_shows(a),
+            Ok(None) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("canon: {e}");
+                ExitCode::from(2)
+            }
+        },
+        "movies" => match parse_common("movies", raw_args) {
+            Ok(Some(a)) => cmd_movies(a),
+            Ok(None) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("canon: {e}");
+                ExitCode::from(2)
+            }
+        },
+        "-h" | "--help" => {
+            print!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        "-V" | "--version" => {
+            println!("canon {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        other => {
+            eprintln!("canon: unknown subcommand '{other}' (expected 'shows' or 'movies')");
+            ExitCode::from(2)
+        }
+    }
 }
