@@ -1,44 +1,20 @@
-//! Behavioural tests for the parser and the side-decision logic.
+//! Behavioural tests for the parser and the single-name-per-directory logic.
 //!
 //! Absolute paths are used throughout so the `dir` candidate is deterministic
 //! and never depends on the directory the test runner happens to start in.
+//! All test files share a directory (`/m/` or similar) since `canon` now
+//! resolves one show name per directory rather than per batch.
 
-use canon::parse::{clean, parse, plan, safe, Confidence, Episode, Group, Options, Side};
-use std::collections::HashMap;
+use canon::parse::{clean, parse, plan_dir, safe, Confidence, Season};
 use std::path::{Path, PathBuf};
 
-fn opts() -> Options {
-    Options { prefer: None, use_dir: false, show: None }
-}
-
-fn ep(name: &str) -> Episode {
+fn ep(name: &str) -> canon::parse::Episode {
     parse(Path::new(name)).unwrap_or_else(|| panic!("no anchor found in {name:?}"))
 }
 
-/// Run a batch through `plan`, accepting every default. -> {input basename: new name}
-fn auto_with(files: &[&str], o: Options) -> HashMap<String, String> {
+fn plan(files: &[&str]) -> canon::parse::Plan {
     let paths: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
-    let (groups, _) = plan(&paths, &o);
-    let mut out = HashMap::new();
-    for g in &groups {
-        for (path, new) in g.targets() {
-            out.insert(path.file_name().unwrap().to_string_lossy().into_owned(), new);
-        }
-    }
-    out
-}
-
-fn auto(files: &[&str]) -> HashMap<String, String> {
-    auto_with(files, opts())
-}
-
-fn groups_of(files: &[&str]) -> Vec<Group> {
-    let paths: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
-    plan(&paths, &opts()).0
-}
-
-fn got<'a>(m: &'a HashMap<String, String>, k: &str) -> &'a str {
-    m.get(k).unwrap_or_else(|| panic!("{k:?} missing; have {:?}", m.keys().collect::<Vec<_>>()))
+    plan_dir(&paths)
 }
 
 // ---------------------------------------------------------------- anchors --
@@ -70,10 +46,14 @@ fn anchor_accepts_every_spelling() {
 
 #[test]
 fn anchor_pads_and_preserves_numbers() {
-    assert_eq!(ep("/m/24.S1E1.mkv").target(Side::Left, None), "24 S01E01.mkv");
-    assert_eq!(ep("/m/Show S00E01.mkv").target(Side::Left, None), "Show S00E01.mkv");
-    assert_eq!(ep("/m/Show S01E100.mkv").target(Side::Left, None), "Show S01E100.mkv");
-    assert_eq!(ep("/m/Show S12E345.mkv").target(Side::Left, None), "Show S12E345.mkv");
+    let e = ep("/m/24.S1E1.mkv");
+    assert_eq!(e.target_with(&e.left), "24 S01E01.mkv");
+    let e = ep("/m/Show S00E01.mkv");
+    assert_eq!(e.target_with(&e.left), "Show S00E01.mkv");
+    let e = ep("/m/Show S01E100.mkv");
+    assert_eq!(e.target_with(&e.left), "Show S01E100.mkv");
+    let e = ep("/m/Show S12E345.mkv");
+    assert_eq!(e.target_with(&e.left), "Show S12E345.mkv");
 }
 
 #[test]
@@ -198,7 +178,8 @@ fn extension_is_lowercased_and_preserved() {
 
 #[test]
 fn extension_absent_still_renames() {
-    assert_eq!(ep("/m/Show S01E01").target(Side::Left, None), "Show S01E01");
+    let e = ep("/m/Show S01E01");
+    assert_eq!(e.target_with(&e.left), "Show S01E01");
 }
 
 // ------------------------------------------------------- side extraction --
@@ -217,124 +198,105 @@ fn dir_candidate_comes_from_the_parent_folder() {
     assert_eq!(ep("/Volumes/Media/The.Wire/S03E07.mkv").dir, "The Wire");
 }
 
-// ------------------------------------------------------- name before anchor --
+#[test]
+fn dir_candidate_strips_a_trailing_season_marker() {
+    assert_eq!(ep("/Volumes/Media/Breaking Bad Season 5/S05E14.mkv").dir, "Breaking Bad");
+    assert_eq!(ep("/Volumes/Media/Breaking.Bad.S05/S05E14.mkv").dir, "Breaking Bad");
+}
+
+// ------------------------------------------------------- one name per dir --
 
 #[test]
 fn show_name_before_the_anchor() {
-    let m = auto(&[
-        "/m/The Big Bang Theory (Kaley Cuoco) S07E08 1080p H.264 (moviesbyrizzo upload).mp4",
-        "/m/Breaking.Bad.S05E14.Ozymandias.1080p.WEB-DL.x264-GROUP.mkv",
-        "/m/its.always.sunny.in.philadelphia.7x03.HDTV.XviD-FQM.avi",
-        "/m/The.Office.US.S03E10.720p.BluRay.x265-RARBG.mp4",
-        "/m/Doctor Who (2005) S11E01 1080p.mkv",
-        "/m/24.S1E1.mkv",
-        "/m/Law & Order- SVU S22E03 WEBRip.mp4",
-        "/m/The Wire S03E07 Back Burners 720p Blu-ray DTS-HD x265.mkv",
-        "/m/Severance - Season 2 Episode 5 - 2160p HDR AMZN WEB-DL.mp4",
-    ]);
-    assert_eq!(got(&m, "The Big Bang Theory (Kaley Cuoco) S07E08 1080p H.264 (moviesbyrizzo upload).mp4"), "The Big Bang Theory S07E08.mp4");
-    assert_eq!(got(&m, "Breaking.Bad.S05E14.Ozymandias.1080p.WEB-DL.x264-GROUP.mkv"), "Breaking Bad S05E14.mkv");
-    assert_eq!(got(&m, "its.always.sunny.in.philadelphia.7x03.HDTV.XviD-FQM.avi"), "its always sunny in philadelphia S07E03.avi");
-    assert_eq!(got(&m, "The.Office.US.S03E10.720p.BluRay.x265-RARBG.mp4"), "The Office US S03E10.mp4");
-    assert_eq!(got(&m, "Doctor Who (2005) S11E01 1080p.mkv"), "Doctor Who S11E01.mkv");
-    assert_eq!(got(&m, "24.S1E1.mkv"), "24 S01E01.mkv");
-    assert_eq!(got(&m, "Law & Order- SVU S22E03 WEBRip.mp4"), "Law & Order SVU S22E03.mp4");
-    assert_eq!(got(&m, "The Wire S03E07 Back Burners 720p Blu-ray DTS-HD x265.mkv"), "The Wire S03E07.mkv");
-    assert_eq!(got(&m, "Severance - Season 2 Episode 5 - 2160p HDR AMZN WEB-DL.mp4"), "Severance S02E05.mp4");
+    for (file, want) in [
+        ("/m/The Big Bang Theory (Kaley Cuoco) S07E08 1080p H.264 (moviesbyrizzo upload).mp4", "The Big Bang Theory S07E08.mp4"),
+        ("/m/Breaking.Bad.S05E14.Ozymandias.1080p.WEB-DL.x264-GROUP.mkv", "Breaking Bad S05E14.mkv"),
+        ("/m/its.always.sunny.in.philadelphia.7x03.HDTV.XviD-FQM.avi", "its always sunny in philadelphia S07E03.avi"),
+        ("/m/The.Office.US.S03E10.720p.BluRay.x265-RARBG.mp4", "The Office US S03E10.mp4"),
+        ("/m/Doctor Who (2005) S11E01 1080p.mkv", "Doctor Who S11E01.mkv"),
+        ("/m/24.S1E1.mkv", "24 S01E01.mkv"),
+        ("/m/Law & Order- SVU S22E03 WEBRip.mp4", "Law & Order SVU S22E03.mp4"),
+        ("/m/The Wire S03E07 Back Burners 720p Blu-ray DTS-HD x265.mkv", "The Wire S03E07.mkv"),
+        ("/m/Severance - Season 2 Episode 5 - 2160p HDR AMZN WEB-DL.mp4", "Severance S02E05.mp4"),
+    ] {
+        let p = plan(&[file]);
+        assert_eq!(p.targets()[0].1, want, "for {file}");
+    }
 }
 
 // -------------------------------------------------------- name after anchor --
 
 #[test]
 fn show_name_after_the_anchor_when_left_is_junk() {
-    let m = auto(&[
-        "/m/[SubsPlease] S01E02 - Frieren [1080p][A1B2].mkv",
-        "/m/www.Torrenting.com - S02E05 - Severance - 2160p HDR AMZN WEB-DL.mp4",
-        "/m/S07E08 - The Big Bang Theory 1080p H.264 (moviesbyrizzo upload).mp4",
-    ]);
-    assert_eq!(got(&m, "[SubsPlease] S01E02 - Frieren [1080p][A1B2].mkv"), "Frieren S01E02.mkv");
-    assert_eq!(got(&m, "www.Torrenting.com - S02E05 - Severance - 2160p HDR AMZN WEB-DL.mp4"), "Severance S02E05.mp4");
-    assert_eq!(got(&m, "S07E08 - The Big Bang Theory 1080p H.264 (moviesbyrizzo upload).mp4"), "The Big Bang Theory S07E08.mp4");
+    for (file, want) in [
+        ("/m/[SubsPlease] S01E02 - Frieren [1080p][A1B2].mkv", "Frieren S01E02.mkv"),
+        ("/m/www.Torrenting.com - S02E05 - Severance - 2160p HDR AMZN WEB-DL.mp4", "Severance S02E05.mp4"),
+        ("/m/S07E08 - The Big Bang Theory 1080p H.264 (moviesbyrizzo upload).mp4", "The Big Bang Theory S07E08.mp4"),
+    ] {
+        let p = plan(&[file]);
+        assert_eq!(p.targets()[0].1, want, "for {file}");
+    }
 }
 
 #[test]
 fn batch_consensus_picks_the_repeating_side() {
     // Episode title before the anchor, show name after it. Only the repetition
-    // across the batch reveals which is which.
-    let m = auto(&[
+    // across the directory reveals which is which.
+    let p = plan(&[
         "/m/Ozymandias.S05E14.Breaking.Bad.1080p.mkv",
         "/m/Granite.State.S05E15.Breaking.Bad.1080p.mkv",
         "/m/Felina.S05E16.Breaking.Bad.1080p.mkv",
     ]);
-    assert_eq!(got(&m, "Ozymandias.S05E14.Breaking.Bad.1080p.mkv"), "Breaking Bad S05E14.mkv");
-    assert_eq!(got(&m, "Felina.S05E16.Breaking.Bad.1080p.mkv"), "Breaking Bad S05E16.mkv");
+    assert_eq!(p.name, "Breaking Bad");
+    let m: Vec<(PathBuf, String)> = p.targets();
+    let get = |base: &str| m.iter().find(|(p, _)| p.ends_with(base)).unwrap().1.clone();
+    assert_eq!(get("Ozymandias.S05E14.Breaking.Bad.1080p.mkv"), "Breaking Bad S05E14.mkv");
+    assert_eq!(get("Felina.S05E16.Breaking.Bad.1080p.mkv"), "Breaking Bad S05E16.mkv");
 }
 
 #[test]
 fn a_single_file_cannot_resolve_that_ambiguity() {
     // Alone, the same filename defaults to the left side and gets it wrong.
-    // This is the case the interactive confirm step exists to catch.
-    let m = auto(&["/m/Ozymandias.S05E14.Breaking.Bad.1080p.mkv"]);
-    assert_eq!(got(&m, "Ozymandias.S05E14.Breaking.Bad.1080p.mkv"), "Ozymandias S05E14.mkv");
+    // This is the case the confirm step exists to catch.
+    let p = plan(&["/m/Ozymandias.S05E14.Breaking.Bad.1080p.mkv"]);
+    assert_eq!(p.name, "Ozymandias");
+    assert_eq!(p.confidence, Confidence::Medium);
 }
 
 #[test]
 fn repeating_left_side_is_not_overruled_by_a_repeating_right_side() {
     // Both repeat: left must win, or a re-released season would flip.
-    let m = auto(&[
+    let p = plan(&[
         "/m/Breaking.Bad.S05E14.1080p.WEBDL.mkv",
         "/m/Breaking.Bad.S05E15.1080p.WEBDL.mkv",
     ]);
-    assert_eq!(got(&m, "Breaking.Bad.S05E14.1080p.WEBDL.mkv"), "Breaking Bad S05E14.mkv");
+    assert_eq!(p.name, "Breaking Bad");
 }
 
 // ------------------------------------------------------------- confidence --
 
 #[test]
 fn confidence_reflects_how_much_evidence_there_was() {
-    // Repeated across the batch -> high.
-    let g = groups_of(&["/m/Show.S01E01.1080p.mkv", "/m/Show.S01E02.1080p.mkv"]);
-    assert_eq!(g[0].confidence, Confidence::High);
+    // Repeated across every file in the directory -> high.
+    let p = plan(&["/m/Show.S01E01.1080p.mkv", "/m/Show.S01E02.1080p.mkv"]);
+    assert_eq!(p.confidence, Confidence::High);
 
     // A lone file with only one viable side -> medium.
-    let g = groups_of(&["/m/Show.S01E01.1080p.mkv"]);
-    assert_eq!(g[0].confidence, Confidence::Medium);
+    let p = plan(&["/m/Show.S01E01.1080p.mkv"]);
+    assert_eq!(p.confidence, Confidence::Medium);
 
     // Name after the anchor that never repeats -> low, because it is
     // indistinguishable from an episode title.
-    let g = groups_of(&["/m/Severance/S02E05 - Cold Harbor 1080p.mkv"]);
-    assert_eq!(g[0].confidence, Confidence::Low);
-    assert_eq!(g[0].side, Side::Right);
-    assert_eq!(g[0].name, "Cold Harbor");
-}
-
-// ----------------------------------------------------------------- options --
-
-#[test]
-fn prefer_forces_a_side() {
-    let files = ["/m/Breaking.Bad.S05E14.Ozymandias.1080p.mkv"];
-    let m = auto_with(&files, Options { prefer: Some(Side::Right), use_dir: false, show: None });
-    assert_eq!(got(&m, "Breaking.Bad.S05E14.Ozymandias.1080p.mkv"), "Ozymandias S05E14.mkv");
-    let m = auto_with(&files, Options { prefer: Some(Side::Left), use_dir: false, show: None });
-    assert_eq!(got(&m, "Breaking.Bad.S05E14.Ozymandias.1080p.mkv"), "Breaking Bad S05E14.mkv");
+    let p = plan(&["/m/Severance/S02E05 - Cold Harbor 1080p.mkv"]);
+    assert_eq!(p.confidence, Confidence::Low);
+    assert_eq!(p.name, "Cold Harbor");
 }
 
 #[test]
-fn fallback_dir_uses_the_folder_for_unique_after_anchor_names() {
-    let files = ["/Volumes/Media/Severance/S02E05 - Cold Harbor 1080p.mkv"];
-    let m = auto_with(&files, Options { prefer: None, use_dir: true, show: None });
-    assert_eq!(got(&m, "S02E05 - Cold Harbor 1080p.mkv"), "Severance S02E05.mkv");
-    // Off by default: a real extracted name should not lose to a folder guess.
-    let m = auto(&files);
-    assert_eq!(got(&m, "S02E05 - Cold Harbor 1080p.mkv"), "Cold Harbor S02E05.mkv");
-}
-
-#[test]
-fn show_override_wins_everywhere_and_is_sanitised() {
-    let files = ["/m/whatever.S01E01.mkv", "/m/[grp] S01E02 - Other.mkv"];
-    let m = auto_with(&files, Options { prefer: None, use_dir: false, show: Some("A/B: Show".into()) });
-    assert_eq!(got(&m, "whatever.S01E01.mkv"), "AB Show S01E01.mkv");
-    assert_eq!(got(&m, "[grp] S01E02 - Other.mkv"), "AB Show S01E02.mkv");
+fn no_candidate_on_either_side_falls_back_to_the_directory_name() {
+    let p = plan(&["/Volumes/Media/Severance/S02E05 1080p WEBRip.mkv"]);
+    assert_eq!(p.name, "Severance");
+    assert_eq!(p.confidence, Confidence::Medium);
 }
 
 // ------------------------------------------------------------------ safe() --
@@ -348,60 +310,56 @@ fn safe_removes_characters_filesystems_reject() {
     assert_eq!(safe("tab\there"), "tabhere");
 }
 
-// ------------------------------------------------------------ grouping API --
+// ------------------------------------------------------------- Plan API --
 
 #[test]
-fn plan_groups_by_show_and_sorts_by_episode() {
-    let g = groups_of(&[
+fn plan_sorts_by_episode_and_applies_one_name_to_every_file() {
+    let p = plan(&[
         "/m/Show.S01E03.1080p.mkv",
         "/m/Show.S01E01.1080p.mkv",
-        "/m/Other.S02E01.1080p.mkv",
         "/m/Show.S01E02.1080p.mkv",
     ]);
-    assert_eq!(g.len(), 2);
-    let show = g.iter().find(|x| x.name == "Show").unwrap();
-    assert_eq!(show.files.len(), 3);
-    assert_eq!(show.files.iter().map(|e| e.episode).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(p.episodes.iter().map(|e| e.episode).collect::<Vec<_>>(), vec![1, 2, 3]);
+    let targets = p.targets();
+    assert_eq!(targets[0].1, "Show S01E01.mkv");
+    assert_eq!(targets[1].1, "Show S01E02.mkv");
+    assert_eq!(targets[2].1, "Show S01E03.mkv");
 }
 
 #[test]
 fn plan_reports_skips_without_dropping_them_silently() {
-    let paths: Vec<PathBuf> = ["/m/Show.S01E01.mkv", "/m/Some Movie 2019.mkv"]
-        .iter().map(PathBuf::from).collect();
-    let (groups, skipped) = plan(&paths, &opts());
-    assert_eq!(groups.len(), 1);
-    assert_eq!(skipped.len(), 1);
-    assert_eq!(skipped[0].0, "Some Movie 2019.mkv");
-    assert!(skipped[0].1.contains("anchor"));
+    let p = plan(&["/m/Show.S01E01.mkv", "/m/Some Movie 2019.mkv"]);
+    assert_eq!(p.episodes.len(), 1);
+    assert_eq!(p.skipped.len(), 1);
+    assert_eq!(p.skipped[0].0, "Some Movie 2019.mkv");
+    assert!(p.skipped[0].1.contains("anchor"));
 }
 
 #[test]
-fn group_offers_only_sides_every_file_has() {
-    let g = groups_of(&["/m/Show.S01E01.1080p.mkv", "/m/Show.S01E02.Title.1080p.mkv"]);
-    let show = &g[0];
-    assert!(show.offerable(Side::Left));
-    assert!(show.offerable(Side::Dir));
-    // Only the second file has text after the anchor, so "right" is not offerable.
-    assert!(!show.offerable(Side::Right));
+fn plan_season_is_single_when_every_file_agrees() {
+    let p = plan(&["/m/Show.S05E01.mkv", "/m/Show.S05E02.mkv"]);
+    assert_eq!(p.season, Season::Single(5));
 }
 
 #[test]
-fn group_values_for_lists_distinct_candidates_in_order() {
-    let g = groups_of(&[
-        "/m/Ozymandias.S05E14.Breaking.Bad.1080p.mkv",
-        "/m/Granite.State.S05E15.Breaking.Bad.1080p.mkv",
-    ]);
-    let show = &g[0];
-    assert_eq!(show.values_for(Side::Right), vec!["Breaking Bad"]);
-    assert_eq!(show.values_for(Side::Left), vec!["Ozymandias", "Granite State"]);
+fn plan_season_varies_when_files_disagree() {
+    let p = plan(&["/m/Show.S04E10.mkv", "/m/Show.S05E01.mkv"]);
+    assert_eq!(p.season, Season::Varies(4, 5));
 }
 
 #[test]
-fn group_override_beats_the_chosen_side() {
-    let mut g = groups_of(&["/m/Show.S01E01.mkv"]).remove(0);
-    g.override_name = Some("Renamed".into());
-    assert_eq!(g.targets()[0].1, "Renamed S01E01.mkv");
-    assert_eq!(g.display_name(), "Renamed");
+fn plan_preview_shows_the_first_episode_renamed() {
+    let p = plan(&["/m/Show.S01E02.mkv", "/m/Show.S01E01.mkv"]);
+    assert_eq!(p.preview(), Some("Show S01E01.mkv".to_string()));
+}
+
+#[test]
+fn set_name_overrides_the_detected_name_and_is_sanitised() {
+    let mut p = plan(&["/m/whatever.S01E01.mkv", "/m/[grp] S01E02 - Other.mkv"]);
+    p.set_name("A/B: Show");
+    assert_eq!(p.confidence, Confidence::High);
+    let targets = p.targets();
+    assert!(targets.iter().all(|(_, new)| new.starts_with("AB Show S01E0")));
 }
 
 // ------------------------------------------------------ known limitations --
@@ -409,29 +367,28 @@ fn group_override_beats_the_chosen_side() {
 #[test]
 fn documented_gaps_behave_predictably() {
     // Multi-episode files keep only the first episode number.
-    let m = auto(&["/m/Show.S01E01-E02.mkv"]);
-    assert_eq!(got(&m, "Show.S01E01-E02.mkv"), "Show S01E01.mkv");
+    let p = plan(&["/m/Show.S01E01-E02.mkv"]);
+    assert_eq!(p.targets()[0].1, "Show S01E01.mkv");
 
     // An unbracketed year stays in the title (stripping it would break
     // legitimate titles such as "Class of 1999").
-    let m = auto(&["/m/Doctor Who 2005 S11E01 1080p.mkv"]);
-    assert_eq!(got(&m, "Doctor Who 2005 S11E01 1080p.mkv"), "Doctor Who 2005 S11E01.mkv");
+    let p = plan(&["/m/Doctor Who 2005 S11E01 1080p.mkv"]);
+    assert_eq!(p.targets()[0].1, "Doctor Who 2005 S11E01.mkv");
 
     // Initialisms written with dots lose them along with the separators.
-    let m = auto(&["/m/Marvel's Agents of S.H.I.E.L.D. S03E12 1080p.mkv"]);
-    assert_eq!(got(&m, "Marvel's Agents of S.H.I.E.L.D. S03E12 1080p.mkv"),
-               "Marvel's Agents of S H I E L D S03E12.mkv");
+    let p = plan(&["/m/Marvel's Agents of S.H.I.E.L.D. S03E12 1080p.mkv"]);
+    assert_eq!(p.targets()[0].1, "Marvel's Agents of S H I E L D S03E12.mkv");
 
     // Casing is preserved, never corrected.
-    let m = auto(&["/m/its.always.sunny.S07E03.mkv"]);
-    assert_eq!(got(&m, "its.always.sunny.S07E03.mkv"), "its always sunny S07E03.mkv");
+    let p = plan(&["/m/its.always.sunny.S07E03.mkv"]);
+    assert_eq!(p.targets()[0].1, "its always sunny S07E03.mkv");
 }
 
 #[test]
 fn already_canonical_names_are_stable() {
     // Running canon twice must not drift.
-    let m = auto(&["/m/Severance S02E05.mkv"]);
-    assert_eq!(got(&m, "Severance S02E05.mkv"), "Severance S02E05.mkv");
-    let m = auto(&["/m/The Office US S03E10.mp4"]);
-    assert_eq!(got(&m, "The Office US S03E10.mp4"), "The Office US S03E10.mp4");
+    let p = plan(&["/m/Severance S02E05.mkv"]);
+    assert_eq!(p.targets()[0].1, "Severance S02E05.mkv");
+    let p = plan(&["/m/The Office US S03E10.mp4"]);
+    assert_eq!(p.targets()[0].1, "The Office US S03E10.mp4");
 }

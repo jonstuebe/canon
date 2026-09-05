@@ -19,20 +19,18 @@ cargo install --path .
 ## Use
 
 ```sh
-canon ~/Downloads/*.mkv           # dry run: show what would change
-canon --apply ~/Downloads/*.mkv   # confirm each show, then rename
+canon ~/Downloads/Breaking\ Bad\ Season\ 5           # dry run: show what would change
+canon --apply ~/Downloads/Breaking\ Bad\ Season\ 5   # confirm, then rename
 ```
 
-Pass a whole season at once. Names are decided **across the batch**, so more
-files in one invocation means better guesses — see "Batch consensus" below.
+Point it at one show's directory at a time. Every file directly inside it is
+assumed to belong to the same show, and the name is decided **across all of
+them at once** — see "Batch consensus" below — then applied uniformly.
 
 | flag | effect |
 |---|---|
 | `--apply` | perform the renames (default is a dry run) |
-| `--yes` | skip the confirm step and accept every default |
-| `--prefer left\|right` | force which side of the anchor holds the show name |
-| `--fallback-dir` | when the name after the anchor doesn't repeat, use the folder name |
-| `--show <NAME>` | override the show name for every file |
+| `--yes` | skip the confirm step and accept the detected name |
 
 ## How it works
 
@@ -56,6 +54,8 @@ only**. Trailing-only is deliberate: it is what preserves the `US` in
 
 **3. Deciding between them.** If only one side survives cleaning, it wins. If
 both do, the left side wins by default — *unless* batch consensus overrules it.
+If neither side survives, the directory name itself is the fallback, since a
+person chose it to describe what's inside.
 
 **Batch consensus:** show names repeat across a season, episode titles do not.
 So a right-hand candidate that appears in several files beats a left-hand one
@@ -66,27 +66,27 @@ Ozymandias.S05E14.Breaking.Bad.1080p.mkv      -> Breaking Bad S05E14.mkv
 Granite.State.S05E15.Breaking.Bad.1080p.mkv   -> Breaking Bad S05E15.mkv
 ```
 
-This is why the tool is batch-oriented rather than per-file: the decision for
-any one filename depends on the others.
+This is why the tool looks at the whole directory rather than one file at a
+time: the decision for any one filename depends on the others in it.
 
-**4. Confirm.** Proposals are grouped by show and confirmed once per show, not
-once per file, with the rejected candidates offered as numbered choices:
+**4. Confirm.** One name is decided for the whole directory and confirmed
+once, not once per file:
 
 ```
-Cold Harbor  (1 file)   confidence: LOW
-  why: right side only, and it does NOT repeat -- could be an episode title
-  S02E05 - Cold Harbor 1080p.mkv
-     -> Cold Harbor S02E05.mkv
-  choices:
-    [1] Cold Harbor   (text after SxxEyy)  <- current
-    [2] Severance     (folder name)
-  [enter] accept  [1-9] pick  [t] type a name  [s] skip  [l] list all  [a] accept all  [q] quit >
+Show Name: Breaking Bad
+Season Number: 5
+Confidence: high
+Preview: Breaking Bad S05E14.mkv  (24 files)
+
+accept: Y/n/e >
 ```
 
-Confidence is derived, not decorative: `high` means the batch corroborated the
-name, `medium` means it defaulted with only one file to go on, `LOW` means it is
-genuinely ambiguous. In practice you hold enter through the greens and stop at
-the reds.
+`Y` (or enter) accepts, `n` aborts with nothing renamed, and `e` lets you type
+the correct name, after which the summary re-renders for another confirm.
+
+Confidence is derived, not decorative: `high` means the files corroborated the
+name, `medium` means it defaulted with limited evidence, `LOW` means it is
+genuinely ambiguous — that's your cue to reach for `e` instead of enter.
 
 Before touching disk it refuses to run if two files would land on the same name,
 or if a target already exists — all or nothing, never half a rename.
@@ -116,13 +116,11 @@ looks like the same batch idea, does not change that. Two also truncate
 ## Development
 
 ```sh
-cargo test          # 34 tests covering anchors, cleaning, decisions, gaps
+cargo test          # tests covering anchors, cleaning, decisions, gaps
 ```
 
-`reference/rename_eps.py` is the original Python prototype, kept as a
-differential-testing oracle. Both implementations must agree on the corpus:
-
-```sh
-cargo run -q -- --yes $(cat corpus.txt) | grep '\->'
-python3 reference/rename_eps.py --yes $(cat corpus.txt) | grep '\->'
-```
+`reference/rename_eps.py` is the original Python prototype. Its `clean`/`split`
+functions are kept as a differential-testing oracle for the anchor and
+cleaning logic in `src/parse.rs` — those must keep agreeing on `corpus.txt`.
+Its own CLI still reflects the old multi-show-per-invocation design and has
+not been updated to match `canon`'s current one-directory interface.

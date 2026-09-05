@@ -1,6 +1,12 @@
-//! Filename parsing: find the anchor, extract candidates, decide between them.
+//! Filename parsing: find the anchor, extract candidates, decide the show name.
 //!
 //! Pure logic only -- no I/O, no prompting. `main` drives this.
+//!
+//! `canon` operates on one show directory per invocation: every file passed
+//! in is assumed to belong to the same show, so `plan_dir` settles on a
+//! single name (using batch consensus across the whole directory to tell a
+//! repeating show name from a one-off episode title) and applies it to
+//! every file.
 
 use regex::Regex;
 use std::collections::HashMap;
@@ -57,6 +63,10 @@ re!(SCENE_GROUP, r"-[A-Za-z0-9]{2,}$");
 // ("Spider-Man", "X-Men") is part of the title and must survive.
 re!(DASHES, r"\s+[-\x{2013}\x{2014}]+\s*|[-\x{2013}\x{2014}]+\s+|[-\x{2013}\x{2014}]{2,}");
 re!(SPACES, r"\s{2,}");
+// A season marker trailing a directory name -- "Breaking Bad Season 5",
+// "Breaking.Bad.S05" -- with no episode part, so the anchor regex above
+// (which requires an episode number) never catches it.
+re!(DIR_SEASON_TAIL, r"(?i)[\s._-]*(?:season[\s._-]*\d{1,2}|s\d{1,2})$");
 
 /// Reduce one side of the anchor to a bare show-name candidate.
 pub fn clean(raw: &str) -> String {
@@ -110,24 +120,6 @@ fn find_anchor(stem: &str) -> Option<regex::Captures<'_>> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum Side {
-    Left,
-    Right,
-    Dir,
-}
-
-impl Side {
-    pub const ALL: [Side; 3] = [Side::Left, Side::Right, Side::Dir];
-    pub fn label(self) -> &'static str {
-        match self {
-            Side::Left => "text before SxxEyy",
-            Side::Right => "text after SxxEyy",
-            Side::Dir => "folder name",
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Confidence {
     High,
     Medium,
@@ -147,16 +139,8 @@ pub struct Episode {
 }
 
 impl Episode {
-    pub fn candidate(&self, side: Side) -> &str {
-        match side {
-            Side::Left => &self.left,
-            Side::Right => &self.right,
-            Side::Dir => &self.dir,
-        }
-    }
-
-    pub fn target(&self, side: Side, override_name: Option<&str>) -> String {
-        let name = override_name.unwrap_or_else(|| self.candidate(side));
+    /// The renamed basename this episode would get under the given show name.
+    pub fn target_with(&self, name: &str) -> String {
         format!("{} S{:02}E{:02}{}", name, self.season, self.episode, self.ext)
     }
 
@@ -202,6 +186,8 @@ pub fn parse(path: &Path) -> Option<Episode> {
             .and_then(|v| v.as_str().parse().ok())
             .unwrap_or(0)
     };
+    let dir_raw = parent_name(path);
+    let dir_raw = DIR_SEASON_TAIL.replace(&dir_raw, "");
     Some(Episode {
         path: path.to_path_buf(),
         season: num("s1", "s2", "s3"),
@@ -209,168 +195,122 @@ pub fn parse(path: &Path) -> Option<Episode> {
         ext,
         left: clean(&stem[..m.start()]),
         right: clean(&stem[m.end()..]),
-        dir: clean(&parent_name(path)),
+        dir: clean(&dir_raw),
     })
 }
 
-#[derive(Clone, Debug)]
-pub struct Decision {
-    pub side: Option<Side>,
-    pub confidence: Confidence,
-    pub reason: &'static str,
+/// How season numbers look across every file in the directory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Season {
+    /// No file had an anchor to read a season number from.
+    Unknown,
+    Single(u32),
+    /// Files disagreed on the season number -- shown as a range.
+    Varies(u32, u32),
 }
 
-/// Pick which side of the anchor holds the show name.
+fn season_summary(episodes: &[Episode]) -> Season {
+    let mut seasons: Vec<u32> = episodes.iter().map(|e| e.season).collect();
+    seasons.sort_unstable();
+    seasons.dedup();
+    match seasons.as_slice() {
+        [] => Season::Unknown,
+        [only] => Season::Single(*only),
+        [first, .., last] => Season::Varies(*first, *last),
+    }
+}
+
+/// Pick a single show name for the whole directory.
 ///
 /// The core ambiguity: text after the anchor is either the show name or the
 /// episode title, and one filename cannot distinguish them. Batch frequency
-/// can -- show names repeat across a season, episode titles do not.
-pub fn decide(
-    ep: &Episode,
-    left_counts: &HashMap<String, usize>,
-    right_counts: &HashMap<String, usize>,
-    prefer: Option<Side>,
-    use_dir: bool,
-) -> Decision {
-    let d = |side, confidence, reason| Decision { side: Some(side), confidence, reason };
-    if let Some(side) = prefer {
-        return d(side, Confidence::High, "forced by --prefer");
+/// can -- show names repeat across a season, episode titles do not. When
+/// neither side repeats, the directory name itself (the folder the user
+/// pointed canon at) is the fallback, since it was chosen by a person to
+/// describe what's in it.
+fn decide_dir(episodes: &[Episode]) -> (String, Confidence) {
+    let mut left_counts: HashMap<&str, usize> = HashMap::new();
+    let mut right_counts: HashMap<&str, usize> = HashMap::new();
+    for e in episodes {
+        if !e.left.is_empty() {
+            *left_counts.entry(e.left.as_str()).or_insert(0) += 1;
+        }
+        if !e.right.is_empty() {
+            *right_counts.entry(e.right.as_str()).or_insert(0) += 1;
+        }
     }
-    let count = |m: &HashMap<String, usize>, k: &str| *m.get(k).unwrap_or(&0);
-    let (has_left, has_right) = (!ep.left.is_empty(), !ep.right.is_empty());
+    let top = |m: &HashMap<&str, usize>| -> Option<(String, usize)> {
+        m.iter().max_by_key(|&(_, &c)| c).map(|(k, &c)| (k.to_string(), c))
+    };
+    let total = episodes.len();
+    let full = |c: usize| c > 1 && c == total;
 
-    if has_left && !has_right {
-        let c = if count(left_counts, &ep.left) > 1 { Confidence::High } else { Confidence::Medium };
-        return d(Side::Left, c, "only the left side survived cleaning");
-    }
-    if has_right && !has_left {
-        if count(right_counts, &ep.right) > 1 {
-            return d(Side::Right, Confidence::High, "right side, repeats across the batch");
+    match (top(&left_counts), top(&right_counts)) {
+        (Some((lname, lc)), Some((rname, rc))) => {
+            if rc > 1 && lc <= 1 {
+                (rname, if full(rc) { Confidence::High } else { Confidence::Medium })
+            } else if lc > 1 {
+                (lname, if full(lc) { Confidence::High } else { Confidence::Medium })
+            } else if rc > 1 {
+                (rname, Confidence::Medium)
+            } else {
+                (lname, Confidence::Medium) // single file, or nothing repeats: default left
+            }
         }
-        if !ep.dir.is_empty() && use_dir {
-            return d(Side::Dir, Confidence::Medium, "--fallback-dir: name after anchor is unique");
+        (Some((lname, lc)), None) => (lname, if lc > 1 { Confidence::High } else { Confidence::Medium }),
+        (None, Some((rname, rc))) => (rname, if rc > 1 { Confidence::High } else { Confidence::Low }),
+        (None, None) => {
+            let dir = episodes.first().map(|e| e.dir.clone()).unwrap_or_default();
+            if !dir.is_empty() {
+                (dir, Confidence::Medium)
+            } else {
+                (String::new(), Confidence::Low)
+            }
         }
-        return d(Side::Right, Confidence::Low,
-            "right side only, and it does NOT repeat -- could be an episode title");
     }
-    if has_left && has_right {
-        if count(right_counts, &ep.right) > 1 && count(left_counts, &ep.left) == 1 {
-            return d(Side::Right, Confidence::High, "right side repeats, left side is unique");
-        }
-        let c = if count(left_counts, &ep.left) > 1 { Confidence::High } else { Confidence::Medium };
-        return d(Side::Left, c, "both sides populated, defaulted to left");
-    }
-    if !ep.dir.is_empty() {
-        return d(Side::Dir, Confidence::Low, "no candidate on either side, used folder name");
-    }
-    Decision { side: None, confidence: Confidence::Low, reason: "no show name found" }
 }
 
-/// A set of episodes that resolved to the same show name.
+/// The result of scanning one show directory: a single name and season
+/// picture applied to every file in it, plus whatever couldn't be parsed.
 #[derive(Clone, Debug)]
-pub struct Group {
+pub struct Plan {
     pub name: String,
-    pub side: Side,
     pub confidence: Confidence,
-    pub reason: String,
-    pub files: Vec<Episode>,
-    /// Set when the user typed a name by hand; wins over `side`.
-    pub override_name: Option<String>,
+    pub season: Season,
+    pub episodes: Vec<Episode>,
+    pub skipped: Vec<(String, String)>,
 }
 
-impl Group {
-    pub fn display_name(&self) -> &str {
-        self.override_name.as_deref().unwrap_or(&self.name)
+impl Plan {
+    /// One example rename, to show what the chosen name looks like applied.
+    pub fn preview(&self) -> Option<String> {
+        self.episodes.first().map(|e| e.target_with(&self.name))
     }
+
     pub fn targets(&self) -> Vec<(PathBuf, String)> {
-        self.files.iter()
-            .map(|e| (e.path.clone(), e.target(self.side, self.override_name.as_deref())))
-            .collect()
+        self.episodes.iter().map(|e| (e.path.clone(), e.target_with(&self.name))).collect()
     }
-    /// Distinct values a side takes across this group, in order.
-    pub fn values_for(&self, side: Side) -> Vec<&str> {
-        let mut seen: Vec<&str> = Vec::new();
-        for e in &self.files {
-            let v = e.candidate(side);
-            if !v.is_empty() && !seen.contains(&v) {
-                seen.push(v);
-            }
-        }
-        seen
-    }
-    /// A side is offerable only if every file in the group has one.
-    pub fn offerable(&self, side: Side) -> bool {
-        self.files.iter().all(|e| !e.candidate(side).is_empty())
+
+    /// Apply a hand-typed name, overriding whatever was detected.
+    pub fn set_name(&mut self, name: &str) {
+        self.name = safe(name);
+        self.confidence = Confidence::High;
     }
 }
 
-pub struct Options {
-    pub prefer: Option<Side>,
-    pub use_dir: bool,
-    pub show: Option<String>,
-}
-
-/// Resolve a whole batch into groups keyed by show name, plus skips.
-///
-/// Batch-wide by design: `decide` needs to see every filename before it can
-/// settle any single one, so this cannot be applied file-by-file.
-pub fn plan(paths: &[PathBuf], opts: &Options) -> (Vec<Group>, Vec<(String, String)>) {
-    let parsed: Vec<(&PathBuf, Option<Episode>)> =
-        paths.iter().map(|p| (p, parse(p))).collect();
-
-    let mut left_counts: HashMap<String, usize> = HashMap::new();
-    let mut right_counts: HashMap<String, usize> = HashMap::new();
-    for (_, ep) in &parsed {
-        if let Some(e) = ep {
-            if !e.left.is_empty() {
-                *left_counts.entry(e.left.clone()).or_insert(0) += 1;
-            }
-            if !e.right.is_empty() {
-                *right_counts.entry(e.right.clone()).or_insert(0) += 1;
-            }
-        }
-    }
-
-    let mut groups: Vec<Group> = Vec::new();
-    let mut skipped: Vec<(String, String)> = Vec::new();
-    for (path, ep) in parsed {
+/// Resolve every file in one show directory into a single `Plan`.
+pub fn plan_dir(paths: &[PathBuf]) -> Plan {
+    let mut episodes = Vec::new();
+    let mut skipped = Vec::new();
+    for path in paths {
         let base = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        let Some(ep) = ep else {
-            skipped.push((base, "no SxxEyy anchor".into()));
-            continue;
-        };
-        let (side, confidence, reason, name) = if let Some(show) = &opts.show {
-            (Side::Left, Confidence::High, "--show override", safe(show))
-        } else {
-            let d = decide(&ep, &left_counts, &right_counts, opts.prefer, opts.use_dir);
-            let Some(side) = d.side else {
-                skipped.push((base, d.reason.into()));
-                continue;
-            };
-            let name = ep.candidate(side).to_string();
-            if name.is_empty() {
-                skipped.push((base, "the chosen side was empty".into()));
-                continue;
-            }
-            (side, d.confidence, d.reason, name)
-        };
-
-        match groups.iter_mut().find(|g| {
-            g.name == name && g.side == side && g.confidence == confidence && g.reason == reason
-        }) {
-            Some(g) => g.files.push(ep),
-            None => groups.push(Group {
-                name,
-                side,
-                confidence,
-                reason: reason.to_string(),
-                files: vec![ep],
-                override_name: opts.show.as_ref().map(|s| safe(s)),
-            }),
+        match parse(path) {
+            Some(e) => episodes.push(e),
+            None => skipped.push((base, "no SxxEyy anchor".into())),
         }
     }
-    for g in &mut groups {
-        g.files.sort_by_key(|e| (e.season, e.episode));
-    }
-    (groups, skipped)
+    episodes.sort_by_key(|e| (e.season, e.episode));
+    let (name, confidence) = decide_dir(&episodes);
+    let season = season_summary(&episodes);
+    Plan { name, confidence, season, episodes, skipped }
 }

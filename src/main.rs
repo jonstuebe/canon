@@ -1,6 +1,6 @@
-//! Interactive CLI: propose renames, confirm them per show, then apply.
+//! Interactive CLI: scan one show directory, confirm a name once, then apply.
 
-use canon::parse::{plan, safe, Confidence, Group, Options, Side};
+use canon::parse::{plan_dir, Confidence, Plan, Season};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -11,55 +11,38 @@ const DIM: &str = "\x1b[2m";
 const RED: &str = "\x1b[31m";
 const YEL: &str = "\x1b[33m";
 const GRN: &str = "\x1b[32m";
-const CYN: &str = "\x1b[36m";
 const OFF: &str = "\x1b[0m";
 
 const USAGE: &str = "\
 canon -- rename TV episode files to \"Show Name SxxEyy.ext\"
 
 USAGE:
-    canon [OPTIONS] <FILE>...
+    canon [OPTIONS] <DIRECTORY>
 
 OPTIONS:
     --apply           perform the renames (default: dry run)
-    --yes             skip the confirm step, accept every default
-    --prefer <SIDE>   force which side of SxxEyy holds the show name: left|right
-    --fallback-dir    when the name after SxxEyy does not repeat, use the folder name
-    --show <NAME>     override the show name for every file
+    --yes             skip the confirm step, accept the detected name
     -h, --help        show this help
     -V, --version     show version
 
-Pass a whole season at once: canon ~/Downloads/*.mkv
-Names are decided across the batch, so more files means better guesses.
+canon looks at every file directly inside DIRECTORY, decides a single show
+name for all of them (using agreement across the files, falling back to the
+directory name), and confirms that name once before renaming.
 ";
 
 struct Args {
-    paths: Vec<PathBuf>,
+    dir: PathBuf,
     apply: bool,
     yes: bool,
-    opts: Options,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
-    let mut paths = Vec::new();
-    let (mut apply, mut yes, mut use_dir) = (false, false, false);
-    let (mut prefer, mut show) = (None, None);
-    let mut it = std::env::args().skip(1);
-    while let Some(a) = it.next() {
+    let mut dir = None;
+    let (mut apply, mut yes) = (false, false);
+    for a in std::env::args().skip(1) {
         match a.as_str() {
             "--apply" => apply = true,
             "--yes" | "-y" => yes = true,
-            "--fallback-dir" => use_dir = true,
-            "--prefer" => {
-                prefer = match it.next().as_deref() {
-                    Some("left") => Some(Side::Left),
-                    Some("right") => Some(Side::Right),
-                    other => return Err(format!("--prefer wants left|right, got {other:?}")),
-                }
-            }
-            "--show" => {
-                show = Some(it.next().ok_or("--show wants a name")?);
-            }
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return Ok(None);
@@ -69,13 +52,26 @@ fn parse_args() -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown flag: {s}")),
-            s => paths.push(PathBuf::from(s)),
+            s if dir.is_none() => dir = Some(PathBuf::from(s)),
+            s => return Err(format!("canon takes one directory; got an extra argument: {s}")),
         }
     }
-    if paths.is_empty() {
-        return Err("no files given (try --help)".into());
+    let dir = dir.ok_or("no directory given (try --help)")?;
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {}", dir.display()));
     }
-    Ok(Some(Args { paths, apply, yes, opts: Options { prefer, use_dir, show } }))
+    Ok(Some(Args { dir, apply, yes }))
+}
+
+/// Every regular file directly inside `dir`, sorted for deterministic output.
+fn read_dir_files(dir: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.path())
+        .collect();
+    files.sort();
+    Ok(files)
 }
 
 /// Prompt on /dev/tty when stdin is a glob or pipe, falling back to stdin.
@@ -107,7 +103,7 @@ impl Console {
         let mut line = String::new();
         match std::io::stdin().read_line(&mut line) {
             Ok(n) if n > 0 => line.trim().to_string(),
-            _ => "q".to_string(), // real EOF: treat as quit, never as blanket yes
+            _ => "n".to_string(), // real EOF: treat as decline, never as blanket yes
         }
     }
 }
@@ -120,111 +116,44 @@ fn mark(c: Confidence) -> String {
     }
 }
 
-fn show_group(g: &Group, limit: Option<usize>) {
-    let targets = g.targets();
-    let n = limit.unwrap_or(targets.len()).min(targets.len());
-    for (path, new) in &targets[..n] {
-        let base = path.file_name().unwrap_or_default().to_string_lossy();
-        println!("  {DIM}{base}{OFF}\n     -> {new}");
+fn show_summary(plan: &Plan) {
+    println!();
+    let name = if plan.name.is_empty() { format!("{DIM}(none found){OFF}") } else { plan.name.clone() };
+    println!("{BOLD}Show Name:{OFF} {name}");
+    match plan.season {
+        Season::Single(n) => println!("{BOLD}Season Number:{OFF} {n}"),
+        Season::Varies(a, b) => println!("{BOLD}Season Number:{OFF} varies ({a}-{b})"),
+        Season::Unknown => {}
     }
-    if n < targets.len() {
-        println!("  {DIM}... and {} more{OFF}", targets.len() - n);
+    println!("{BOLD}Confidence:{OFF} {}", mark(plan.confidence));
+    if let Some(p) = plan.preview() {
+        let count = plan.episodes.len();
+        let suffix = if count > 1 { format!("  {DIM}({count} files){OFF}") } else { String::new() };
+        println!("{BOLD}Preview:{OFF} {p}{suffix}");
     }
 }
 
-/// Walk the groups, letting the user accept, re-pick a side, rename, or skip.
-/// Returns the groups to act on.
-fn confirm(groups: &mut [Group], auto_accept: bool) -> Option<Vec<usize>> {
+/// One confirmation for the whole directory: accept, decline, or type a name.
+/// Returns false if the user declined.
+fn confirm(plan: &mut Plan, auto_yes: bool) -> bool {
     let mut console = Console::new();
-    let mut accept_rest = auto_accept;
-    let mut keep = Vec::new();
-
-    for (i, g) in groups.iter_mut().enumerate() {
-        loop {
-            {
-                println!(
-                    "\n{BOLD}{}{OFF}  ({} file{})   confidence: {}",
-                    g.display_name(),
-                    g.files.len(),
-                    if g.files.len() == 1 { "" } else { "s" },
-                    mark(g.confidence)
-                );
-                println!("  {DIM}why: {}{OFF}", g.reason);
-                show_group(g, Some(3));
-            }
-            if accept_rest {
-                keep.push(i);
-                break;
-            }
-
-            // A side is offerable only if every file in the group has one.
-            let mut choices = vec![g.side];
-            for s in Side::ALL {
-                if s != g.side && g.offerable(s) {
-                    choices.push(s);
+    loop {
+        show_summary(plan);
+        if auto_yes {
+            return true;
+        }
+        match console.ask("\naccept: Y/n/e > ").to_lowercase().as_str() {
+            "" | "y" => return true,
+            "n" => return false,
+            "e" => {
+                let typed = console.ask("Show name > ");
+                if !typed.trim().is_empty() {
+                    plan.set_name(&typed);
                 }
             }
-            println!("  {BOLD}choices:{OFF}");
-            for (n, s) in choices.iter().enumerate() {
-                let vals = g.values_for(*s);
-                let shown = match vals.len() {
-                    0 => "(none)".to_string(),
-                    1 => vals[0].to_string(),
-                    _ => format!("{} / {} … (varies per file)", vals[0], vals[1]),
-                };
-                let cur = if *s == g.side && g.override_name.is_none() {
-                    format!("  {CYN}<- current{OFF}")
-                } else {
-                    String::new()
-                };
-                println!("    [{}] {}   {DIM}({}){}{OFF}", n + 1, shown, s.label(), cur);
-            }
-
-            let ans = console
-                .ask("  [enter] accept  [1-9] pick  [t] type a name  [s] skip  [l] list all  [a] accept all  [q] quit > ")
-                .to_lowercase();
-            match ans.as_str() {
-                "" | "y" => {
-                    keep.push(i);
-                    break;
-                }
-                "a" => {
-                    accept_rest = true;
-                    keep.push(i);
-                    break;
-                }
-                "s" => break,
-                "q" => {
-                    println!("\nAborted, nothing renamed.");
-                    return None;
-                }
-                "l" => show_group(g, None),
-                "t" => {
-                    let typed = console.ask("  new show name > ");
-                    let cleaned = safe(&typed);
-                    if !cleaned.is_empty() && typed.to_lowercase() != "q" {
-                        g.override_name = Some(cleaned.clone());
-                        g.name = cleaned;
-                        g.confidence = Confidence::High;
-                        g.reason = "typed by hand".to_string();
-                    }
-                }
-                d if d.parse::<usize>().is_ok_and(|n| n >= 1 && n <= choices.len()) => {
-                    let side = choices[d.parse::<usize>().unwrap() - 1];
-                    let picked = g.values_for(side).first().map(|s| s.to_string());
-                    if let Some(name) = picked {
-                        g.side = side;
-                        g.override_name = None;
-                        g.name = name;
-                        g.confidence = Confidence::High;
-                        g.reason = format!("confirmed: {}", side.label());
-                    }
-                }
-                _ => println!("  {YEL}?{OFF}"),
-            }
+            _ => println!("{YEL}?{OFF}"),
         }
     }
-    Some(keep)
 }
 
 fn main() -> ExitCode {
@@ -237,30 +166,41 @@ fn main() -> ExitCode {
         }
     };
 
-    let (mut groups, skipped) = plan(&args.paths, &args.opts);
-    if groups.is_empty() {
+    let paths = match read_dir_files(&args.dir) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("canon: can't read {}: {e}", args.dir.display());
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut plan = plan_dir(&paths);
+    if plan.episodes.is_empty() {
         println!("Nothing to rename.");
-        for (base, why) in &skipped {
+        for (base, why) in &plan.skipped {
             println!("  {DIM}SKIP  {base}  ({why}){OFF}");
         }
         return ExitCode::SUCCESS;
     }
 
-    let auto_accept = args.yes || args.opts.show.is_some();
-    let Some(keep) = confirm(&mut groups, auto_accept) else {
+    if args.yes && plan.name.is_empty() {
+        eprintln!("canon: --yes given but no show name could be detected; run without --yes to type one");
+        return ExitCode::from(1);
+    }
+
+    if !confirm(&mut plan, args.yes) {
+        println!("\nAborted, nothing renamed.");
         return ExitCode::SUCCESS;
-    };
+    }
 
     // --- safety checks before touching disk ---
     let mut planned: Vec<(PathBuf, String)> = Vec::new();
     let mut unchanged = 0usize;
-    for i in keep {
-        for (path, new) in groups[i].targets() {
-            if path.file_name().is_some_and(|f| f.to_string_lossy() == new) {
-                unchanged += 1;
-            } else {
-                planned.push((path, new));
-            }
+    for (path, new) in plan.targets() {
+        if path.file_name().is_some_and(|f| f.to_string_lossy() == new) {
+            unchanged += 1;
+        } else {
+            planned.push((path, new));
         }
     }
 
@@ -278,11 +218,11 @@ fn main() -> ExitCode {
     }
 
     println!("\n{BOLD}Summary{OFF}");
-    println!("  {} file(s) to rename across {} group(s)", planned.len(), groups.len());
+    println!("  {} file(s) to rename", planned.len());
     if unchanged > 0 {
         println!("  {DIM}{unchanged} file(s) already correctly named{OFF}");
     }
-    for (base, why) in &skipped {
+    for (base, why) in &plan.skipped {
         println!("  {DIM}skipped: {base}  ({why}){OFF}");
     }
     for n in &collisions {
@@ -302,14 +242,6 @@ fn main() -> ExitCode {
     if !collisions.is_empty() || !exists.is_empty() {
         println!("\n{RED}Refusing to apply: resolve the conflicts above first.{OFF}");
         return ExitCode::from(1);
-    }
-    if !args.yes {
-        let mut console = Console::new();
-        let ans = console.ask(&format!("\nApply {} rename(s)? [y/N] > ", planned.len()));
-        if ans.to_lowercase() != "y" {
-            println!("Aborted, nothing renamed.");
-            return ExitCode::SUCCESS;
-        }
     }
 
     let (mut done, mut failed) = (0, 0);
