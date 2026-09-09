@@ -182,12 +182,6 @@ cargo test          # tests covering anchors, cleaning, decisions, gaps
 modules with their own test files (`tests/parse_tests.rs`, `tests/movie_tests.rs`);
 `main.rs` only wires I/O and prompting around whichever one the subcommand picks.
 
-`reference/rename_eps.py` is the original Python prototype. Its `clean`/`split`
-functions are kept as a differential-testing oracle for the anchor and
-cleaning logic in `src/parse.rs` — those must keep agreeing on `corpus.txt`.
-Its own CLI still reflects the old multi-show-per-invocation design and has
-not been updated to match `canon`'s current one-directory interface.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
