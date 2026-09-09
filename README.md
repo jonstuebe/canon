@@ -187,3 +187,7 @@ functions are kept as a differential-testing oracle for the anchor and
 cleaning logic in `src/parse.rs` — those must keep agreeing on `corpus.txt`.
 Its own CLI still reflects the old multi-show-per-invocation design and has
 not been updated to match `canon`'s current one-directory interface.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
