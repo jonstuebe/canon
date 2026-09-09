@@ -140,6 +140,29 @@ These are design boundaries, not bugs:
 - **Movies: no year, no confidence.** A movie release with no `19xx`/`20xx`
   token anywhere in the name always comes back `LOW` and asks for a title.
 
+## Acceptable use
+
+`canon` is a filename renaming utility. It reads names, computes new names, and
+optionally calls `rename` — it does not download, acquire, decrypt, distribute,
+stream, or play anything, and it has no network access of any kind.
+
+It is intended for organizing media you have the legal right to possess: discs
+you own and ripped for personal use, files you purchased or downloaded from a
+licensed service, and content you created or that is in the public domain.
+
+**Using this tool on illegally obtained or pirated files is expressly
+prohibited.** Do not use `canon` to organize, catalogue, prepare, or otherwise
+handle material you acquired by infringing copyright, circumventing DRM, or
+violating the terms of any service. Copyright law varies by jurisdiction and
+you are solely responsible for knowing and complying with the law where you
+live.
+
+The author does not condone, endorse, or provide support for copyright
+infringement, and takes no responsibility for what you point this tool at. Per
+the MIT license, the software is provided "as is", without warranty of any
+kind; the author is not liable for any claim, damages, or other liability
+arising from its use. Nothing here is legal advice.
+
 ## Why not an existing crate
 
 `hunch`, `torrent-name-parser` and `media_filename` were each measured against
