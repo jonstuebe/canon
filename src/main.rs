@@ -1,5 +1,6 @@
-//! Interactive CLI: `canon shows <dir>` and `canon movies <dir>`.
+//! Interactive CLI: `canon shows <dir>`, `canon movies <dir>` and `canon books <dir>`.
 
+use canon::book::{plan_books, BookPlan};
 use canon::movie::{plan_movies, MoviePlan};
 use canon::parse::{plan_dir, Confidence, Plan, Season};
 use std::fs::{File, OpenOptions};
@@ -20,6 +21,7 @@ canon -- rename media files to a canonical name
 USAGE:
     canon shows  [OPTIONS] <DIRECTORY>
     canon movies [OPTIONS] <DIRECTORY>
+    canon books  [OPTIONS] <DIRECTORY>
 
 OPTIONS:
     --apply           perform the renames (default: dry run)
@@ -37,6 +39,12 @@ movies:
     Every file directly inside DIRECTORY is assumed to be a different movie.
     canon renames each to \"Title (Year).ext\", listing every result; it only
     stops to ask when a file's year (and so its title) can't be found.
+
+books:
+    Every file directly inside DIRECTORY is assumed to be a different
+    audiobook. canon renames each to \"Author - Series NN - Title.ext\",
+    dropping the author or series when the name doesn't reveal one; it only
+    stops to ask when no author could be told apart from the title.
 ";
 
 struct Args {
@@ -255,6 +263,63 @@ fn cmd_movies(args: Args) -> ExitCode {
     apply_renames(targets, &plan.skipped, args.apply)
 }
 
+// --- books ---
+
+/// Confirm every planned book rename in one pass, exactly as movies does:
+/// high-confidence lines are listed and accepted silently, and only `Low`
+/// (no author could be separated from the title) stops to ask.
+fn confirm_books(plan: &mut BookPlan, auto_yes: bool) -> Vec<(PathBuf, String)> {
+    let mut console = Console::new();
+    let width = plan.items.iter().map(|i| i.target().len()).max().unwrap_or(0);
+    let mut targets = Vec::new();
+    let mut newly_skipped = Vec::new();
+
+    for item in plan.items.iter_mut() {
+        if item.confidence == Confidence::Low {
+            if auto_yes {
+                newly_skipped.push((item.basename(), "low confidence, no author found".to_string()));
+                continue;
+            }
+            let prompt = format!("{:width$} [{}] -> type author or Enter to skip: ", item.target(), mark(Confidence::Low));
+            let typed = console.ask(&prompt);
+            if typed.trim().is_empty() {
+                newly_skipped.push((item.basename(), "no author found, skipped".to_string()));
+                continue;
+            }
+            item.set_author(&typed);
+        } else {
+            println!("{:width$} [{}]", item.target(), mark(item.confidence));
+        }
+        targets.push((item.path.clone(), item.target()));
+    }
+
+    plan.skipped.extend(newly_skipped);
+    targets
+}
+
+fn cmd_books(args: Args) -> ExitCode {
+    let paths = match read_dir_files(&args.dir) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("canon: can't read {}: {e}", args.dir.display());
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut plan = plan_books(&paths);
+    if plan.items.is_empty() {
+        println!("Nothing to rename.");
+        for (base, why) in &plan.skipped {
+            println!("  {DIM}SKIP  {base}  ({why}){OFF}");
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    println!();
+    let targets = confirm_books(&mut plan, args.yes);
+    apply_renames(targets, &plan.skipped, args.apply)
+}
+
 // --- shared: safety checks + apply, once a target list has been confirmed ---
 
 fn apply_renames(targets: Vec<(PathBuf, String)>, skipped: &[(String, String)], apply: bool) -> ExitCode {
@@ -351,6 +416,14 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        "books" => match parse_common("books", raw_args) {
+            Ok(Some(a)) => cmd_books(a),
+            Ok(None) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("canon: {e}");
+                ExitCode::from(2)
+            }
+        },
         "-h" | "--help" => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -360,7 +433,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         other => {
-            eprintln!("canon: unknown subcommand '{other}' (expected 'shows' or 'movies')");
+            eprintln!("canon: unknown subcommand '{other}' (expected 'shows', 'movies' or 'books')");
             ExitCode::from(2)
         }
     }

@@ -13,10 +13,17 @@ dependencies = [
 
 [[package]]
 name = "canon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "gender_guesser",
  "regex",
 ]
+
+[[package]]
+name = "gender_guesser"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b93a4238a98f7f34ff4462543eae8587175d7cf24879dd9bfb1b90c3670033e"
 
 [[package]]
 name = "memchr"
