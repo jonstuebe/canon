@@ -1,13 +1,14 @@
 [package]
 name = "canon"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"  # LazyLock (1.80), Option::is_none_or (1.82)
-description = "Rename TV episode files to a canonical \"Show Name SxxEyy.ext\" form"
+description = "Rename TV episode, movie and audiobook files to a canonical name"
 license = "MIT"
 
 [dependencies]
 regex = "1"
+gender_guesser = "0.2"
 
 [profile.release]
 lto = true
