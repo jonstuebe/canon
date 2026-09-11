@@ -308,3 +308,72 @@ fn an_unrecognised_non_western_name_still_wins_on_shape() {
         assert_eq!(one(input), want, "input: {input}");
     }
 }
+
+// --- the author is not always at an end ---
+
+#[test]
+fn an_author_in_the_middle_is_found() {
+    // "Series - Author - Title" is a real convention. Both ends open with an
+    // article here, so neither is name-shaped and only the middle is.
+    let p = plan(&["The Chronicles of Narnia - C S Lewis - The Magician's Nephew.m4b"]);
+    assert_eq!(
+        targets(&p),
+        vec!["C S Lewis - The Chronicles of Narnia - The Magician's Nephew.m4b"]
+    );
+    assert_eq!(p.items[0].confidence, Confidence::High);
+    assert_eq!(p.items[0].author.as_deref(), Some("C S Lewis"));
+}
+
+#[test]
+fn a_middle_author_still_yields_the_series() {
+    let p = plan(&["The Chronicles of Narnia 01 - C S Lewis - The Magician's Nephew.m4b"]);
+    assert_eq!(
+        targets(&p),
+        vec!["C S Lewis - The Chronicles of Narnia 01 - The Magician's Nephew.m4b"]
+    );
+}
+
+#[test]
+fn a_middle_author_beats_a_name_shaped_series_segment() {
+    // "Stormlight Archive" is two capitalised words and so is name-shaped,
+    // but "Brandon Sanderson" scores higher on the dictionary.
+    assert_eq!(
+        one("Stormlight Archive - Brandon Sanderson - The Way of Kings.m4b"),
+        "Brandon Sanderson - Stormlight Archive - The Way of Kings.m4b"
+    );
+}
+
+// --- a typed author must not be spelled twice ---
+
+#[test]
+fn a_typed_author_is_removed_from_the_title() {
+    // bell hooks styled her name in lowercase, so it fails the capitalisation
+    // test and the file comes back LOW with the author still in the title --
+    // exactly the situation where the user types a name that is already there.
+    let mut p = plan(&["The Will to Change - bell hooks.m4b"]);
+    assert_eq!(p.items[0].confidence, Confidence::Low);
+    assert_eq!(p.items[0].title, "The Will to Change - bell hooks");
+    p.items[0].set_author("bell hooks");
+    assert_eq!(p.items[0].target(), "bell hooks - The Will to Change.m4b");
+}
+
+#[test]
+fn a_typed_author_matches_the_title_despite_spacing() {
+    // The user types "CS Lewis"; the file says "C S Lewis". Same name.
+    let p = PathBuf::from("/books/The Chronicles of Narnia - The Magician's Nephew - C S Lewis.m4b");
+    let mut item = canon::book::parse(&p).unwrap();
+    item.title = "The Chronicles of Narnia - C S Lewis - The Magician's Nephew".to_string();
+    item.set_author("CS Lewis");
+    assert_eq!(
+        item.target(),
+        "CS Lewis - The Chronicles of Narnia - The Magician's Nephew.m4b"
+    );
+}
+
+#[test]
+fn subtracting_the_author_never_empties_the_title() {
+    let mut p = plan(&["Xyzzy - The Odyssey.m4b"]);
+    let whole = p.items[0].title.clone();
+    p.items[0].set_author(&whole);
+    assert!(!p.items[0].title.is_empty());
+}

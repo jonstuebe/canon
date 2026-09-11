@@ -57,6 +57,13 @@ re!(
 // never part of the title, and never the author we want.
 re!(NARRATOR, r"(?i)[,;]?\s*\b(?:narrated|read|performed)\s+by\s+.*$");
 
+/// Reduce a name to bare letters and digits, so that spacing and punctuation
+/// stop mattering when comparing two spellings of one name: "C S Lewis",
+/// "CS Lewis" and "c.s. lewis" all squash to the same key.
+fn squash(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
 /// Trim audiobook release junk from the trailing end of an already-cleaned
 /// segment, the same trailing-only way `parse::clean` treats video junk.
 fn trim_book_junk(s: &str) -> String {
@@ -189,9 +196,24 @@ impl BookItem {
     }
 
     /// Apply a hand-typed author, overriding whatever was detected. The
-    /// detected title and series are kept.
+    /// detected series is kept, and so is the title -- except for any segment
+    /// of it that *is* the typed author, which is dropped.
+    ///
+    /// That subtraction is the point: when canon can't identify the author it
+    /// leaves every segment in the title, so the name the user is typing is
+    /// usually still sitting in there. Without this, answering "CS Lewis" to
+    /// "The Chronicles of Narnia - C S Lewis - The Magician's Nephew" spells
+    /// the author twice.
     pub fn set_author(&mut self, name: &str) {
         let name = safe(name);
+        let key = squash(&name);
+        if !key.is_empty() {
+            let kept: Vec<&str> = self.title.split(" - ").filter(|seg| squash(seg) != key).collect();
+            // Never let the subtraction empty the title out entirely.
+            if !kept.is_empty() {
+                self.title = kept.join(" - ");
+            }
+        }
         self.author = (!name.is_empty()).then_some(name);
         self.confidence = Confidence::High;
     }
@@ -256,33 +278,33 @@ pub fn parse(path: &Path) -> Option<BookItem> {
         }
     }
 
-    // Otherwise the author is whichever end of the name looks more like a
-    // person. Only the ends are considered: no convention puts the author in
-    // the middle, and a middle segment is nearly always the series.
+    // Otherwise the author is whichever segment looks most like a person.
+    // Every segment is scored, not just the two ends: "Series - Author -
+    // Title" is a real convention, as in
+    // "The Chronicles of Narnia - C S Lewis - The Magician's Nephew".
     let mut confidence = Confidence::High;
     let author = match strong_author {
         Some(a) => Some(a),
+        // One segment is all title -- there is nothing to take an author from.
         None if segments.len() < 2 => {
             confidence = Confidence::Low;
             None
         }
         None => {
-            let (first, last) = (author_score(&segments[0]), author_score(segments.last().unwrap()));
-            match (first, last) {
-                (0, 0) => {
-                    confidence = Confidence::Low;
-                    None
-                }
-                // A genuine tie: the ends match on shape *and* on what the
-                // dictionary knows, as in "Storm Front - Jim Butcher", where
-                // "Storm" is itself a given name. Convention says the author
-                // leads, but nothing corroborates it, so say so.
-                (f, l) if f == l => {
+            let scores: Vec<u32> = segments.iter().map(|s| author_score(s)).collect();
+            let best = scores.iter().copied().max().unwrap_or(0);
+            if best == 0 {
+                confidence = Confidence::Low;
+                None
+            } else {
+                // Several segments tied for the top score, as in "Storm Front
+                // - Jim Butcher" where "Storm" is itself a given name.
+                // Convention says the author leads, so the earliest wins --
+                // but nothing corroborates it, so say so.
+                if scores.iter().filter(|&&s| s == best).count() > 1 {
                     confidence = Confidence::Medium;
-                    Some(segments.remove(0))
                 }
-                (f, l) if f >= l => Some(segments.remove(0)),
-                _ => Some(segments.pop().unwrap()),
+                Some(segments.remove(scores.iter().position(|&s| s == best).unwrap()))
             }
         }
     };

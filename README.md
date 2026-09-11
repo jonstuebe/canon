@@ -91,15 +91,23 @@ to `Brandon Sanderson`) and `... by Brandon Sanderson` are read as the author
 wherever they appear. The `by` form only applies when what follows is
 name-shaped, so `Gone by Midnight` stays a title.
 
-**2. Otherwise, only the two ends are candidates.** No convention puts the
-author in the middle. Each end is scored on how name-shaped it is: at most four
-capitalised words, no digits, and no word that belongs to a title rather than a
-name (`the`, `of`, `and`, …) — which is what rules out `The Final Empire`. Among
-the survivors, the *shorter* name scores higher, since two-word names are more
-name-like than three-word ones:
+**2. Otherwise, every segment is scored** on how name-shaped it is: at most
+four capitalised words, no digits, and no word that belongs to a title rather
+than a name (`the`, `of`, `and`, …) — which is what rules out
+`The Final Empire`. Among the survivors, the *shorter* name scores higher,
+since two-word names are more name-like than three-word ones, and the
+highest-scoring segment becomes the author:
 
 ```
 Project Hail Mary - Andy Weir.m4b    -> Andy Weir - Project Hail Mary.m4b
+```
+
+The author is not always at an end — `Series - Author - Title` is a real
+convention, so the middle is a candidate too:
+
+```
+The Chronicles of Narnia - C S Lewis - The Magician's Nephew.m4b
+   -> C S Lewis - The Chronicles of Narnia - The Magician's Nephew.m4b
 ```
 
 **3. A recognised given name adds to that score.** Shape alone is not enough —
@@ -130,10 +138,10 @@ Two rules keep this from doing damage:
   and `in` come back `NotSure`), which is why the title-word stoplist has to
   run *before* any lookup.
 
-When both ends still score equally — `Storm Front - Jim Butcher`, where `Storm`
-is itself a given name — convention says the author leads, so the first is
-taken, but the result is marked `medium` rather than `high`, because the
-filename genuinely doesn't say.
+When several segments still score equally — `Storm Front - Jim Butcher`, where
+`Storm` is itself a given name — convention says the author leads, so the
+earliest is taken, but the result is marked `medium` rather than `high`,
+because the filename genuinely doesn't say.
 
 **4. The series is whatever is left that looks numbered.** A bracketed
 `(Mistborn, Book 1)` or `[Mistborn 01]` is lifted out before the brackets are
@@ -154,6 +162,12 @@ to three digits. The number is zero-padded to two.
 `Unabridged`, `64kbps`, `m4b`, and a `narrated by …` performer credit. The list
 is deliberately narrow — no bare `Book` or `Audio`, which would eat
 `The Jungle Book`.
+
+When no segment is name-shaped at all, canon leaves every segment in the title
+rather than guessing. Typing an author at the prompt then also *removes* that
+name from the title if it is sitting in there, ignoring spacing and
+punctuation — answering `CS Lewis` to a title containing `C S Lewis` spells the
+author once, not twice.
 
 Every planned rename is listed at once; only a `LOW` line — no author could be
 told apart from the title — stops to ask for one (or drops that file on an
@@ -249,6 +263,11 @@ These are design boundaries, not bugs:
   Butcher`, where `Storm` is a given name — stay undecidable. Convention wins
   (the author leads) and the line is marked `medium`; that's your cue to check
   it. Only `LOW` lines stop to prompt, so a wrong `medium` needs an abort.
+- **Books: a series with no number stays in the title.** In
+  `C S Lewis - The Chronicles of Narnia - The Magician's Nephew`, the series is
+  not tagged as one, because nothing distinguishes it from title text without
+  a number. The segment order is still `Author - Series - Title`, so the
+  rename is right either way; only the internal labelling differs.
 - **Books: a mononym the dictionary doesn't know** isn't detected as an author,
   since a single word has no shape evidence at all.
 - **Books: the name dictionary is uneven across cultures.** It is used as
